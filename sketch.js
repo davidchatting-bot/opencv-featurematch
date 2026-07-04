@@ -7,9 +7,38 @@ const identityMatrix = [
 
 const imageTransforms = [];
 let mediaBoundingBox = null;
-let closestImageIndex = 0;
+
+// Once a candidate match clears this many RANSAC inliers, stop searching further
+// (temporally-nearer) candidates — an early exit to avoid an O(n^2) alignment
+// search across the whole sequence when the nearest neighbour is already a
+// confident match, which is true for the large majority of burst-sequence pairs.
+const EARLY_EXIT_INLIER_THRESHOLD = 50;
 
 let maskSegmentation = null;
+
+// Real-time playback of the capture sequence, driven by each image's EXIF timestamp.
+const PLAYBACK_END_PAUSE_MS = 3000;
+const PLAYBACK_SPEED = 0.5; // 1 = real-time (matches original capture pace), 0.5 = half speed
+let playbackSchedule = [];
+let playbackStartMillis = 0;
+
+// Used only for images with no recoverable EXIF timestamp, to keep the
+// playback schedule well-formed (monotonically increasing) when falling back
+// to alphabetical-filename ordering.
+const FALLBACK_FRAME_SPACING_MS = 500;
+
+// When the timeline hits a given image's own scheduled moment, it shows at
+// full opacity for this long (real wall-clock ms, NOT scaled by
+// PLAYBACK_SPEED — the "moment" is the crisp instant of the shot itself),
+// centred on its scheduled time. Every image still shows faintly at all
+// times via the constant low alpha in draw().
+const MOMENT_MS = 200;
+
+// 3D camera fly-through: one keyframe per aligned image, framing that image
+// alone, timed to the exact same clock as playbackSchedule above — the camera
+// is exactly centred on an image at the moment it becomes the current frame,
+// then travels to be exactly framed on the next image by its due time.
+let cameraKeyframes = [];
 
 /**
  * Creates the foreground segmenter and waits until it's ready.
@@ -199,6 +228,14 @@ function processHomography(id) {
         bestT0B = multiplyMatrix4x4(t0A, tAB);
         bestInliers = inlierCount;
         bestMatchId = image_a.parentElement.id;
+
+        // Candidates are tried nearest-in-time first (i counts down from n-2),
+        // so a confident match here is very likely the best one available —
+        // stop searching rather than aligning against every earlier frame too.
+        if (bestInliers >= EARLY_EXIT_INLIER_THRESHOLD) {
+          console.log('Early exit: accepting', bestMatchId, 'with', bestInliers, 'inliers (>=', EARLY_EXIT_INLIER_THRESHOLD, ')');
+          break;
+        }
       } else if (!check.valid) {
         console.warn('Rejecting homography with', image_a.parentElement.id, ':', check.reason);
       }
@@ -218,20 +255,26 @@ const textureCache = new WeakMap();
 
 function getTextureFromElement(el) {
   if (!el) return null;
-  
+
+  // Use natural pixel dimensions, not the CSS-rendered box size — el.width/height
+  // reflect layout (and go wrong if #media's display/sizing CSS changes), while
+  // naturalWidth/naturalHeight are the actual decoded image dimensions.
+  const w = el.naturalWidth || el.width;
+  const h = el.naturalHeight || el.height;
+
   // check cache first
   if (textureCache.has(el)) {
     const cached = textureCache.get(el);
     // check if image size changed (unlikely but safe)
-    if (cached.width === el.width && cached.height === el.height) {
+    if (cached.width === w && cached.height === h) {
       return cached;
     }
     // size changed, remove old and recreate
     cached.remove();
   }
-  
+
   // convert HTMLImageElement to p5.Graphics
-  const g = createGraphics(el.width, el.height);
+  const g = createGraphics(w, h);
   g.drawingContext.drawImage(el, 0, 0);
   textureCache.set(el, g);
   return g;
@@ -282,68 +325,18 @@ function upsertMedia(id) {
 }
 
 /**
- * Finds the index of the image whose transformed origin (0,0) is closest to the mouse,
- * taking into account the framing matrix used for drawing.
- * @returns {number} - index of closest image, or -1 if none
- */
-function framingMatrix3x2To4x4(framing) {
-  const [a, b, c, d, e, f] = framing;
-  return [
-    a, c, 0, e,
-    b, d, 0, f,
-    0, 0, 1, 0,
-    0, 0, 0, 1
-  ];
-}
-
-function getClosestImageToMouse() {
-  const mediaElement = select('#media')?.elt;
-  if (!mediaElement) return -1;
-
-  const framingInv = invertMatrix4x4(framingMatrix3x2To4x4(getFramingMatrix3x2(mediaBoundingBox)));
-  if (!framingInv) return -1;
-
-  // Mouse in WEBGL coords (origin at canvas center)
-  const [worldX, worldY] = applyTransform4x4(mouseX - width / 2, mouseY - height / 2, framingInv);
-
-  let closestIndex = -1;
-  let closestDist = Infinity;
-
-  for (let i = 0; i < mediaElement.children.length; i++) {
-    const image = mediaElement.children[i].querySelector('.original');
-    if (!image) continue;
-
-    const transform = getImageTransformFromElement(image, true);
-    if (!transform) continue;
-
-    // Transform image center to world coords
-    const w = image.naturalWidth || image.width;
-    const h = image.naturalHeight || image.height;
-    const [cx, cy] = applyTransform4x4(w / 2, h / 2, transform);
-
-    const dist = Math.sqrt((worldX - cx) ** 2 + (worldY - cy) ** 2);
-    if (dist < closestDist) {
-      closestDist = dist;
-      closestIndex = i;
-    }
-  }
-
-  return closestIndex;
-}
-
-/**
  * Returns the bounding box (in screen coordinates) that contains all media elements,
  * with their transforms applied (using imageTransforms).
  * @returns {{left: number, top: number, right: number, bottom: number}|null}
  */
-function getBoundingBox(selector) {
+function getBoundingBox(selector, indices) {
   const mediaElement = select('#media')?.elt;
   if (!mediaElement) return null;
 
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
 
-  for (let i = 0; i < mediaElement.children.length; i++) {
-    const transform = getImageTransformFromElement(mediaElement.children[i], true) || identityMatrix;
+  for (const i of indices) {
+    const transform = getImageTransformFromElement(mediaElement.children[i], true);
     if (!transform) continue;
 
     const image = mediaElement.children[i].querySelector(selector);
@@ -378,29 +371,69 @@ function getBoundingBox(selector) {
 function draw() {
   const imageSelector = '.original';
   background(220);
-  mediaBoundingBox = getBoundingBox(imageSelector);
 
-  closestImageIndex = getClosestImageToMouse();
+  // Don't animate until every image has been through the segmentation/alignment
+  // pipeline and the playback schedule is ready — the raw #media images (now
+  // visible in the page) show progress until then.
+  if (playbackSchedule.length === 0) return;
+
+  const scheduledIndices = playbackSchedule.map(e => e.index);
+  mediaBoundingBox = getBoundingBox(imageSelector, scheduledIndices);
+
+  const camPose = getCameraPose();
+  if (camPose) {
+    camera(
+      camPose.eye[0], camPose.eye[1], camPose.eye[2],
+      camPose.center[0], camPose.center[1], camPose.center[2],
+      camPose.up[0], camPose.up[1], camPose.up[2]
+    );
+  }
+
+  // Every image shows at a constant low alpha all the time (a translucent
+  // overlapping "stack"), except whichever image's own moment is happening
+  // right now — that one shows fully opaque, drawn last so it stands out
+  // crisply on top rather than being dulled by another low-alpha overlay.
+  // Depth writes are disabled throughout — otherwise the nearer quad's depth
+  // value would block farther ones from blending through underneath it.
+  const elapsed = getPlaybackElapsedMs();
+  const momentHalfWindow = (MOMENT_MS * PLAYBACK_SPEED) / 2;
 
   const mediaElement = select('#media')?.elt;
   if(mediaElement) {
     push();
-      applyMatrix(...getFramingMatrix3x2(mediaBoundingBox));
-      for (let i = 0; i < mediaElement.children.length; i++) {
-        const image = mediaElement.children[i].querySelector(imageSelector);
-        if (image) {
+      drawingContext.depthMask(false);
+
+      let momentEntry = null;
+
+      for (let p = 0; p < playbackSchedule.length; p++) {
+        const entry = playbackSchedule[p];
+        const image = mediaElement.children[entry.index].querySelector(imageSelector);
+        if (!image) continue;
+
+        const inMoment = Math.abs(elapsed - entry.offsetMs) <= momentHalfWindow;
+        if (inMoment && !momentEntry) momentEntry = entry;
+
+        if (!inMoment) {
           push();
-            //tint(255, 127);
-            if(i === closestImageIndex) tint(255, 255);
-            else tint(255, 10);
-            const zDepth = (i === closestImageIndex) ? 0 : -1;
-
+            tint(255, 255 * 0.2);
             const t = getImageTransformFromElement(image, true);
-
-            drawProjectedImage(image, 0, 0, t ? t :identityMatrix, zDepth);
+            drawProjectedImage(image, 0, 0, t, -p);
           pop();
         }
       }
+
+      if (momentEntry) {
+        const image = mediaElement.children[momentEntry.index].querySelector(imageSelector);
+        if (image) {
+          push();
+            tint(255, 255);
+            const t = getImageTransformFromElement(image, true);
+            drawProjectedImage(image, 0, 0, t, 0);
+          pop();
+        }
+      }
+
+      drawingContext.depthMask(true);
     pop();
   }
 }
@@ -671,11 +704,6 @@ function keyPressed() {
   if (key === 'x' || key === 'X') {
     exportAllMediaElements('.original');
   }
-
-  // Set closestImageIndex from number keys
-  if (key >= '0' && key <= '9') {
-    closestImageIndex = Number(key) - 1;
-  }
 }
 
 /**
@@ -743,27 +771,16 @@ function exportAllMediaElements(selector) {
   }
 }
 
-/**
- * Returns a 3x2 affine matrix [a, b, d, e, tx, ty] that frames the bounding box within the canvas.
- * Suitable for p5.js applyMatrix(a, b, d, e, tx, ty).
- * @param {{left: number, top: number, width: number, height: number}} boundingBox
- * @returns {Array} - flat 6-element array [a, b, d, e, tx, ty]
- */
-function getFramingMatrix3x2(boundingBox) {
-  if (!boundingBox) return [1, 0, 0, 1, 0, 0];
-
-  // Compute scale to fit bounding box into canvas
-  const s = Math.min(width / boundingBox.width, height / boundingBox.height);
-
-  // Compute translation to center bounding box at (0,0) for WEBGL origin
-  const tx = -(boundingBox.left + boundingBox.width / 2) * s;
-  const ty = -(boundingBox.top + boundingBox.height / 2) * s;
-
-  // 2D scale + translate in 3x2 form: [a, b, d, e, tx, ty]
-  // [ s, 0, 0 ]
-  // [ 0, s, 0 ]
-  // [ tx, ty, 1 ]
-  return [s, 0, 0, s, tx, ty];
+// Orders two images by their recovered capture sequence: EXIF timestamp when
+// both have one, otherwise alphabetically by filename (images with a
+// timestamp always sort before ones without).
+function compareImagesForSequence(imgA, imgB) {
+  const ta = getImageTimestampFromElement(imgA);
+  const tb = getImageTimestampFromElement(imgB);
+  if (ta && tb) return ta.getTime() - tb.getTime();
+  if (ta) return -1;
+  if (tb) return 1;
+  return imgA.src.localeCompare(imgB.src);
 }
 
 async function processAnyAttachedMedia() {
@@ -779,13 +796,215 @@ async function processAnyAttachedMedia() {
     });
   }));
 
-  // Process images sequentially using a numerical index
-  for (let idx = 0; idx < originals.length; idx++) {
-    const orig = originals[idx];
+  // Phase 1: recover every image's EXIF timestamp up front, before any
+  // alignment work — the processing order below (and buildPlaybackSchedule
+  // afterwards) is derived from these.
+  for (const orig of originals) {
     setImageTransform(orig.elt, identityMatrix);
+    const timestamp = await extractImageTimestamp(orig.elt);
+    setImageTimestamp(orig.elt, timestamp);
+  }
+
+  // Phase 2: segment + align in chronological (or alphabetical-fallback)
+  // order, so each new image is matched against the nearest one actually
+  // preceding it in the recovered sequence.
+  const ordered = [...originals].sort((a, b) => compareImagesForSequence(a.elt, b.elt));
+  for (const orig of ordered) {
     await processImage(orig.elt, orig.parent());
     processHomography(orig.parent().id);
   }
+
+  buildPlaybackSchedule();
+  buildCameraKeyframes();
+}
+
+// Orders images by their recovered capture sequence and records each one's
+// offset (in ms) from the first frame, so draw()/the camera can play the
+// sequence back at the same pace it was actually shot.
+function buildPlaybackSchedule() {
+  const mediaElement = select('#media')?.elt;
+  if (!mediaElement) return;
+
+  const entries = [];
+  for (let i = 0; i < mediaElement.children.length; i++) {
+    const image = mediaElement.children[i].querySelector('.original');
+    if (image) entries.push({ index: i, div: mediaElement.children[i], image });
+  }
+  if (entries.length === 0) return;
+
+  entries.sort((a, b) => compareImagesForSequence(a.image, b.image));
+
+  // Stop the sequence at the first frame with no valid alignment transform,
+  // rather than including a mispositioned/unaligned frame in playback.
+  const aligned = [];
+  for (const e of entries) {
+    if (!getImageTransformFromElement(e.div)) break;
+    aligned.push(e);
+  }
+  if (aligned.length === 0) return;
+
+  const t0 = getImageTimestampFromElement(aligned[0].image)?.getTime();
+
+  let lastOffset = -FALLBACK_FRAME_SPACING_MS;
+  playbackSchedule = aligned.map(e => {
+    const t = getImageTimestampFromElement(e.image)?.getTime();
+    const offsetMs = (t !== undefined && t0 !== undefined) ? (t - t0) : (lastOffset + FALLBACK_FRAME_SPACING_MS);
+    lastOffset = offsetMs;
+    return { index: e.index, offsetMs };
+  });
+  playbackStartMillis = millis();
+}
+
+// Elapsed time (ms) within the current looping playback cycle, in the same
+// units as playbackSchedule's offsetMs — shared by image-frame selection and
+// camera keyframe animation so the two always stay in lockstep. Only the travel
+// between the first and last keyframe is scaled by PLAYBACK_SPEED; the
+// end-of-sequence pause (PLAYBACK_END_PAUSE_MS) always lasts that long in real
+// wall-clock time, regardless of speed. Elapsed keeps advancing past the last
+// keyframe's time during the pause (rather than holding there), so the last
+// image's moment window closes just like every other frame's — leaving the
+// screen blank (camera holds its final position) until the sequence loops.
+function getPlaybackElapsedMs() {
+  if (playbackSchedule.length === 0) return 0;
+
+  const lastOffset = playbackSchedule[playbackSchedule.length - 1].offsetMs;
+  const realTravelDuration = lastOffset / PLAYBACK_SPEED;
+  const realCycleLength = realTravelDuration + PLAYBACK_END_PAUSE_MS;
+  const realElapsed = (millis() - playbackStartMillis) % realCycleLength;
+
+  return realElapsed * PLAYBACK_SPEED;
+}
+
+// Fits a single image edge-to-edge ("square" to the camera) into a
+// perspective camera's view, deriving size/center/roll directly from its own
+// transformed corners (via the same applyTransform4x4 used to draw it) —
+// an aligned image is often rotated slightly in world space, so an
+// axis-aligned bounding box around it (viewed by a non-rolled camera) would
+// leave gaps rather than exactly filling the frame.
+function computeCameraKeyframeForImage(image, transform) {
+  const w = image.naturalWidth || image.width;
+  const h = image.naturalHeight || image.height;
+
+  const [cx, cy] = applyTransform4x4(w / 2, h / 2, transform);
+  const [tlx, tly] = applyTransform4x4(0, 0, transform);
+  const [trx, tryy] = applyTransform4x4(w, 0, transform);
+  const [blx, bly] = applyTransform4x4(0, h, transform);
+
+  // Right/up edge vectors of the transformed image in world space — their
+  // lengths give the image's true (un-inflated) footprint, and the up
+  // vector's direction gives the camera roll needed to match the image's own
+  // rotation, so the frame fills edge-to-edge instead of leaving gaps.
+  const worldW = Math.hypot(trx - tlx, tryy - tly);
+  const worldH = Math.hypot(blx - tlx, bly - tly);
+  const upLen = Math.hypot(blx - tlx, bly - tly) || 1;
+  const up = [(blx - tlx) / upLen, (bly - tly) / upLen, 0];
+
+  const fovY = PI / 3; // p5's default WEBGL vertical field of view (60deg)
+  const aspect = width / height;
+
+  const distForHeight = (worldH / 2) / Math.tan(fovY / 2);
+  const distForWidth = (worldW / 2) / (Math.tan(fovY / 2) * aspect);
+  const dist = Math.max(distForHeight, distForWidth);
+
+  return {
+    eye: [cx, cy, dist],
+    center: [cx, cy, 0],
+    up
+  };
+}
+
+// Derives one camera keyframe per successfully-aligned image (from the same
+// transforms buildPlaybackSchedule just validated), framing that image alone.
+// Each keyframe's time matches that image's playbackSchedule offset exactly,
+// so the camera is precisely, squarely framed on an image the moment it's due.
+function buildCameraKeyframes() {
+  const mediaElement = select('#media')?.elt;
+  if (!mediaElement || playbackSchedule.length === 0) { cameraKeyframes = []; return; }
+
+  cameraKeyframes = playbackSchedule.map(entry => {
+    const image = mediaElement.children[entry.index].querySelector('.original');
+    const transform = getImageTransformFromElement(image, true);
+    const pose = computeCameraKeyframeForImage(image, transform);
+    return { time: entry.offsetMs, ...pose };
+  });
+}
+
+function lerp3(a, b, t) {
+  return [
+    a[0] + (b[0] - a[0]) * t,
+    a[1] + (b[1] - a[1]) * t,
+    a[2] + (b[2] - a[2]) * t
+  ];
+}
+
+// Returns the interpolated {eye, center, up} camera pose for the current
+// moment: exactly kfA at kfA.time, exactly kfB at kfB.time, travelling smoothly
+// between — using the same elapsed clock that gates each image's own moment
+// window in draw(), so the camera is always centred on whichever image (if
+// any) is currently in its moment.
+function getCameraPose() {
+  if (cameraKeyframes.length === 0) return null;
+  if (cameraKeyframes.length === 1) return cameraKeyframes[0];
+
+  const elapsed = getPlaybackElapsedMs();
+
+  let i = 0;
+  while (i < cameraKeyframes.length - 1 && cameraKeyframes[i + 1].time <= elapsed) i++;
+
+  const kfA = cameraKeyframes[i];
+  const kfB = cameraKeyframes[Math.min(i + 1, cameraKeyframes.length - 1)];
+  if (kfA === kfB) return kfA;
+
+  const span = kfB.time - kfA.time;
+  const t = span > 0 ? constrain((elapsed - kfA.time) / span, 0, 1) : 1;
+
+  return {
+    eye: lerp3(kfA.eye, kfB.eye, t),
+    center: lerp3(kfA.center, kfB.center, t),
+    up: lerp3(kfA.up, kfB.up, t)
+  };
+}
+
+// Reads DateTimeOriginal + SubSecTimeOriginal via exif-js and combines them
+// into a single Date with millisecond precision (EXIF only stores whole seconds).
+function extractImageTimestamp(imgElement) {
+  return new Promise((resolve) => {
+    EXIF.getData(imgElement, function () {
+      const dateTimeOriginal = EXIF.getTag(this, 'DateTimeOriginal');
+      const subSecTimeOriginal = EXIF.getTag(this, 'SubsecTimeOriginal');
+      const timestamp = parseExifDateTime(dateTimeOriginal, subSecTimeOriginal);
+      console.log('EXIF timestamp for', imgElement.src, ':', dateTimeOriginal, subSecTimeOriginal, '->', timestamp);
+      resolve(timestamp);
+    });
+  });
+}
+
+function parseExifDateTime(dateTimeOriginal, subSecTimeOriginal) {
+  if (!dateTimeOriginal) return null;
+
+  const match = dateTimeOriginal.match(/^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})$/);
+  if (!match) return null;
+
+  const [year, month, day, hour, minute, second] = match.slice(1).map(Number);
+  const ms = subSecTimeOriginal ? Math.round(parseFloat('0.' + subSecTimeOriginal) * 1000) : 0;
+
+  // EXIF months are 1-indexed; JS Date months are 0-indexed
+  return new Date(year, month - 1, day, hour, minute, second, ms);
+}
+
+function setImageTimestamp(element, timestamp) {
+  console.log('setImageTimestamp', element, timestamp);
+  if (element && timestamp instanceof Date) {
+    element.setAttribute('data-timestamp', timestamp.getTime());
+  }
+}
+
+function getImageTimestampFromElement(element) {
+  if (element) {
+    const t = element.getAttribute('data-timestamp');
+    if (t !== null) return new Date(Number(t));
+  }
+  return null;
 }
 
 async function processImage(originalImgElement, div) {
