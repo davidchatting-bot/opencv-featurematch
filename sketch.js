@@ -22,17 +22,29 @@ const PLAYBACK_SPEED = 0.5; // 1 = real-time (matches original capture pace), 0.
 let playbackSchedule = [];
 let playbackStartMillis = 0;
 
+// Space bar pauses/resumes playback. Pausing just freezes the clock that
+// drives everything else (getPlaybackElapsedMs) rather than touching
+// playbackStartMillis directly, so resuming continues exactly where it left
+// off instead of jumping.
+let isPaused = false;
+let pauseBeganAtMillis = 0;
+let totalPausedMs = 0;
+
+function getEffectiveMillis() {
+  const now = isPaused ? pauseBeganAtMillis : millis();
+  return now - totalPausedMs;
+}
+
 // Used only for images with no recoverable EXIF timestamp, to keep the
 // playback schedule well-formed (monotonically increasing) when falling back
 // to alphabetical-filename ordering.
 const FALLBACK_FRAME_SPACING_MS = 500;
 
-// When the timeline hits a given image's own scheduled moment, it shows at
-// full opacity for this long (real wall-clock ms, NOT scaled by
-// PLAYBACK_SPEED — the "moment" is the crisp instant of the shot itself),
-// centred on its scheduled time. Every image still shows faintly at all
-// times via the constant low alpha in draw().
-const MOMENT_MS = 200;
+// Once the timeline reaches a given image's own scheduled moment, it holds
+// at full opacity for this long afterward (real wall-clock ms, NOT scaled by
+// PLAYBACK_SPEED) — never before its own time, only after. Every image still
+// shows faintly at all times via the constant low alpha in draw().
+const HOLD_MS = 500;
 
 // 3D camera fly-through: one keyframe per aligned image, framing that image
 // alone, timed to the exact same clock as playbackSchedule above — the camera
@@ -380,7 +392,32 @@ function draw() {
   const scheduledIndices = playbackSchedule.map(e => e.index);
   mediaBoundingBox = getBoundingBox(imageSelector, scheduledIndices);
 
-  const camPose = getCameraPose();
+  // Every image shows at a constant low alpha all the time (a translucent
+  // overlapping "stack"), except whichever image's own moment is happening
+  // right now — that one shows fully opaque, drawn last so it stands out
+  // crisply on top rather than being dulled by another low-alpha overlay.
+  // Rewind never highlights any image — it's just the camera travelling back
+  // to the start, not a second forward playthrough.
+  const elapsed = getPlaybackElapsedMs();
+  const holdWindow = HOLD_MS * PLAYBACK_SPEED; // full hold duration, scaled — no time before the photo's own offset
+  let momentPos = -1;
+  if (!isRewinding()) {
+    for (let p = 0; p < playbackSchedule.length; p++) {
+      const offsetMs = playbackSchedule[p].offsetMs;
+      if (elapsed >= offsetMs && elapsed < offsetMs + holdWindow) { momentPos = p; break; }
+    }
+  }
+  const momentIndex = momentPos >= 0 ? playbackSchedule[momentPos].index : -1;
+
+  updateDebugTimeDisplay(elapsed, momentIndex);
+
+  // While an image is in its own moment, the camera must be at exactly that
+  // image's keyframe pose — not the generically time-interpolated one, which
+  // is still travelling toward it for almost all of the moment window and
+  // only exactly arrives at the single instant its offset is due. Using the
+  // interpolated pose throughout the window left the highlighted image
+  // mis-framed (cropped or margined) for most of its own flash.
+  const camPose = momentPos >= 0 ? cameraKeyframes[momentPos] : getCameraPose();
   if (camPose) {
     camera(
       camPose.eye[0], camPose.eye[1], camPose.eye[2],
@@ -389,45 +426,33 @@ function draw() {
     );
   }
 
-  // Every image shows at a constant low alpha all the time (a translucent
-  // overlapping "stack"), except whichever image's own moment is happening
-  // right now — that one shows fully opaque, drawn last so it stands out
-  // crisply on top rather than being dulled by another low-alpha overlay.
   // Depth writes are disabled throughout — otherwise the nearer quad's depth
   // value would block farther ones from blending through underneath it.
-  const elapsed = getPlaybackElapsedMs();
-  const momentHalfWindow = (MOMENT_MS * PLAYBACK_SPEED) / 2;
-
   const mediaElement = select('#media')?.elt;
   if(mediaElement) {
     push();
       drawingContext.depthMask(false);
-
-      let momentEntry = null;
 
       for (let p = 0; p < playbackSchedule.length; p++) {
         const entry = playbackSchedule[p];
         const image = mediaElement.children[entry.index].querySelector(imageSelector);
         if (!image) continue;
 
-        const inMoment = Math.abs(elapsed - entry.offsetMs) <= momentHalfWindow;
-        if (inMoment && !momentEntry) momentEntry = entry;
-
-        if (!inMoment) {
+        if (entry.index !== momentIndex) {
           push();
             tint(255, 255 * 0.2);
-            const t = getImageTransformFromElement(image, true);
+            const t = stripShear(getImageTransformFromElement(image, true));
             drawProjectedImage(image, 0, 0, t, -p);
           pop();
         }
       }
 
-      if (momentEntry) {
-        const image = mediaElement.children[momentEntry.index].querySelector(imageSelector);
+      if (momentIndex >= 0) {
+        const image = mediaElement.children[momentIndex].querySelector(imageSelector);
         if (image) {
           push();
             tint(255, 255);
-            const t = getImageTransformFromElement(image, true);
+            const t = stripShear(getImageTransformFromElement(image, true));
             drawProjectedImage(image, 0, 0, t, 0);
           pop();
         }
@@ -704,6 +729,17 @@ function keyPressed() {
   if (key === 'x' || key === 'X') {
     exportAllMediaElements('.original');
   }
+
+  if (key === ' ') {
+    if (isPaused) {
+      totalPausedMs += millis() - pauseBeganAtMillis;
+      isPaused = false;
+    } else {
+      pauseBeganAtMillis = millis();
+      isPaused = true;
+    }
+    return false; // prevent the browser's default page-scroll-on-space
+  }
 }
 
 /**
@@ -855,24 +891,100 @@ function buildPlaybackSchedule() {
   playbackStartMillis = millis();
 }
 
+// Rewind travels back to the start this many times faster than forward
+// playback — a quick single motion rather than a full-speed mirror of the
+// forward pass.
+const REWIND_SPEED_MULTIPLIER = 2;
+
+// Shared phase arithmetic for getPlaybackElapsedMs() and isRewinding(), all
+// using the pausable getEffectiveMillis() clock. Four phases:
+//  1. Forward: 0 -> lastOffset, scaled by PLAYBACK_SPEED.
+//  2. Extended forward: time keeps running normally (same PLAYBACK_SPEED
+//     scaling, no special-casing) for a further HOLD_MS of real time past
+//     lastOffset — otherwise the last photo's hold window would be cut off
+//     the instant it's reached, while every other photo gets its full
+//     HOLD_MS afterward.
+//  3. End-of-sequence pause: always PLAYBACK_END_PAUSE_MS of real wall-clock
+//     time regardless of speed.
+//  4. Rewind: lastOffset -> 0, at REWIND_SPEED_MULTIPLIER x the forward speed.
+function getPlaybackPhaseInfo() {
+  const lastOffset = playbackSchedule[playbackSchedule.length - 1].offsetMs;
+  const realTravelDuration = lastOffset / PLAYBACK_SPEED;
+  const realExtendedTravelDuration = realTravelDuration + HOLD_MS;
+  const rewindSpeed = PLAYBACK_SPEED * REWIND_SPEED_MULTIPLIER;
+  const realRewindDuration = lastOffset / rewindSpeed;
+  const realCycleLength = realExtendedTravelDuration + PLAYBACK_END_PAUSE_MS + realRewindDuration;
+  const realElapsed = (getEffectiveMillis() - playbackStartMillis) % realCycleLength;
+
+  return { lastOffset, realExtendedTravelDuration, rewindSpeed, realCycleLength, realElapsed };
+}
+
 // Elapsed time (ms) within the current looping playback cycle, in the same
 // units as playbackSchedule's offsetMs — shared by image-frame selection and
-// camera keyframe animation so the two always stay in lockstep. Only the travel
-// between the first and last keyframe is scaled by PLAYBACK_SPEED; the
-// end-of-sequence pause (PLAYBACK_END_PAUSE_MS) always lasts that long in real
-// wall-clock time, regardless of speed. Elapsed keeps advancing past the last
-// keyframe's time during the pause (rather than holding there), so the last
-// image's moment window closes just like every other frame's — leaving the
-// screen blank (camera holds its final position) until the sequence loops.
+// camera keyframe animation so the two always stay in lockstep. After the
+// extended-forward phase, elapsed is pushed far past lastOffset so the last
+// image's moment window (already closed naturally) stays closed for the
+// pause (screen blank, camera holds) instead of staying lit throughout.
 function getPlaybackElapsedMs() {
   if (playbackSchedule.length === 0) return 0;
 
-  const lastOffset = playbackSchedule[playbackSchedule.length - 1].offsetMs;
-  const realTravelDuration = lastOffset / PLAYBACK_SPEED;
-  const realCycleLength = realTravelDuration + PLAYBACK_END_PAUSE_MS;
-  const realElapsed = (millis() - playbackStartMillis) % realCycleLength;
+  const { lastOffset, realExtendedTravelDuration, rewindSpeed, realElapsed } = getPlaybackPhaseInfo();
 
-  return realElapsed * PLAYBACK_SPEED;
+  if (realElapsed < realExtendedTravelDuration) {
+    return realElapsed * PLAYBACK_SPEED;
+  }
+
+  if (realElapsed < realExtendedTravelDuration + PLAYBACK_END_PAUSE_MS) {
+    return lastOffset + 1e6; // far outside any moment window — blank, camera holds
+  }
+
+  const rewindReal = realElapsed - realExtendedTravelDuration - PLAYBACK_END_PAUSE_MS;
+  return lastOffset - rewindReal * rewindSpeed;
+}
+
+// True only during the rewind leg — used to suppress the per-image moment
+// highlight there, since rewind is just the camera travelling back to the
+// start rather than a second forward playthrough.
+function isRewinding() {
+  if (playbackSchedule.length === 0) return false;
+  const { realExtendedTravelDuration, realElapsed } = getPlaybackPhaseInfo();
+  return realElapsed >= realExtendedTravelDuration + PLAYBACK_END_PAUSE_MS;
+}
+
+// Writes the current playback clock to a plain DOM element outside the
+// canvas (#debug-time), so timing can be read directly off the page rather
+// than inferred from what's rendered.
+function updateDebugTimeDisplay(elapsed, momentIndex) {
+  const el = document.getElementById('debug-time');
+  if (!el) return;
+
+  const phase = isPaused ? 'paused' : (isRewinding() ? 'rewinding' : 'forward');
+  const momentLabel = momentIndex >= 0 ? `#${momentIndex}` : 'none';
+  el.textContent = `elapsed: ${elapsed.toFixed(0)}ms | phase: ${phase} | in moment: ${momentLabel}`;
+}
+
+// Alignment homographies carry a small amount of shear — estimation noise,
+// since a real photo can't physically shear relative to another shot of the
+// same static scene — which renders as a slightly parallelogram-shaped image
+// rather than a clean rectangle. Reconstructs a shear-free rotation + uniform
+// scale + translation transform from the real one, using the top edge (a,c)
+// as the source of truth (matching computeCameraKeyframeForImage's own
+// rotation convention) and discarding the left edge's independent shear.
+function stripShear(transform) {
+  if (!transform) return transform;
+
+  const a = transform[0], c = transform[4];
+  const tx = transform[3], ty = transform[7];
+
+  const scale = Math.hypot(a, c) || 1;
+  const cosT = a / scale, sinT = c / scale;
+
+  return [
+    scale * cosT, -scale * sinT, 0, tx,
+    scale * sinT,  scale * cosT, 0, ty,
+    0, 0, 1, 0,
+    0, 0, 0, 1
+  ];
 }
 
 // Fits a single image edge-to-edge ("square" to the camera) into a
@@ -891,17 +1003,24 @@ function computeCameraKeyframeForImage(image, transform) {
   const [blx, bly] = applyTransform4x4(0, h, transform);
 
   // Right/up edge vectors of the transformed image in world space — their
-  // lengths give the image's true (un-inflated) footprint, and the up
-  // vector's direction gives the camera roll needed to match the image's own
-  // rotation, so the frame fills edge-to-edge instead of leaving gaps.
-  const worldW = Math.hypot(trx - tlx, tryy - tly);
+  // lengths give the image's true (un-inflated) footprint. Real (especially
+  // weakly-matched) homographies carry real shear, so the left edge and top
+  // edge don't rotate by quite the same angle — the camera roll is derived
+  // from the top edge (rotated 90°) rather than the left edge directly, to
+  // match isReasonableHomography's own atan2(c,a) rotation convention and
+  // stay immune to the left edge's independent shear noise.
+  const rightX = trx - tlx, rightY = tryy - tly;
+  const worldW = Math.hypot(rightX, rightY);
   const worldH = Math.hypot(blx - tlx, bly - tly);
-  const upLen = Math.hypot(blx - tlx, bly - tly) || 1;
-  const up = [(blx - tlx) / upLen, (bly - tly) / upLen, 0];
+  const rightLen = worldW || 1;
+  const up = [-rightY / rightLen, rightX / rightLen, 0];
 
   const fovY = PI / 3; // p5's default WEBGL vertical field of view (60deg)
   const aspect = width / height;
 
+  // "Contain" fit, not "cover" — the whole image must stay visible with no
+  // cropping; when its aspect ratio doesn't match the canvas's, the
+  // less-restrictive dimension is left with empty margins instead.
   const distForHeight = (worldH / 2) / Math.tan(fovY / 2);
   const distForWidth = (worldW / 2) / (Math.tan(fovY / 2) * aspect);
   const dist = Math.max(distForHeight, distForWidth);
@@ -923,7 +1042,7 @@ function buildCameraKeyframes() {
 
   cameraKeyframes = playbackSchedule.map(entry => {
     const image = mediaElement.children[entry.index].querySelector('.original');
-    const transform = getImageTransformFromElement(image, true);
+    const transform = stripShear(getImageTransformFromElement(image, true));
     const pose = computeCameraKeyframeForImage(image, transform);
     return { time: entry.offsetMs, ...pose };
   });
