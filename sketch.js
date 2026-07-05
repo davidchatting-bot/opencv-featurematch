@@ -18,7 +18,7 @@ let maskSegmentation = null;
 
 // Real-time playback of the capture sequence, driven by each image's EXIF timestamp.
 const PLAYBACK_END_PAUSE_MS = 3000;
-const PLAYBACK_SPEED = 0.5; // 1 = real-time (matches original capture pace), 0.5 = half speed
+const PLAYBACK_SPEED = 0.1; // 1 = real-time (matches original capture pace), 0.1 = one-tenth speed
 let playbackSchedule = [];
 let playbackStartMillis = 0;
 
@@ -45,6 +45,15 @@ const FALLBACK_FRAME_SPACING_MS = 500;
 // PLAYBACK_SPEED) — never before its own time, only after. Every image still
 // shows faintly at all times via the constant low alpha in draw().
 const HOLD_MS = 500;
+
+// Alpha jumps instantly to full opacity when a photo's hold begins, then
+// ramps smoothly back down to LOW_ALPHA over this much of the end of the
+// hold window (real ms, same convention as HOLD_MS). Clamped to the hold
+// window's own length if HOLD_MS is shorter.
+const FADE_MS = 150;
+
+// The constant background level every image sits at outside its own hold window.
+const LOW_ALPHA = 0.2;
 
 // 3D camera fly-through: one keyframe per aligned image, framing that image
 // alone, timed to the exact same clock as playbackSchedule above — the camera
@@ -393,31 +402,35 @@ function draw() {
   mediaBoundingBox = getBoundingBox(imageSelector, scheduledIndices);
 
   // Every image shows at a constant low alpha all the time (a translucent
-  // overlapping "stack"), except whichever image's own moment is happening
-  // right now — that one shows fully opaque, drawn last so it stands out
-  // crisply on top rather than being dulled by another low-alpha overlay.
-  // Rewind never highlights any image — it's just the camera travelling back
-  // to the start, not a second forward playthrough.
+  // overlapping "stack"), fading smoothly up to full opacity and back down
+  // again around its own scheduled moment (never before it, only after) —
+  // whichever image is currently brightest is drawn last so it stands out
+  // crisply on top rather than being dulled by another overlay. Rewind never
+  // highlights any image — it's just the camera travelling back to the
+  // start, not a second forward playthrough.
   const elapsed = getPlaybackElapsedMs();
-  const holdWindow = HOLD_MS * PLAYBACK_SPEED; // full hold duration, scaled — no time before the photo's own offset
-  let momentPos = -1;
-  if (!isRewinding()) {
-    for (let p = 0; p < playbackSchedule.length; p++) {
-      const offsetMs = playbackSchedule[p].offsetMs;
-      if (elapsed >= offsetMs && elapsed < offsetMs + holdWindow) { momentPos = p; break; }
-    }
+  const rewinding = isRewinding();
+  const holdWindow = HOLD_MS * PLAYBACK_SPEED;
+  const fadeWindow = Math.min(FADE_MS * PLAYBACK_SPEED, holdWindow);
+
+  const alphas = playbackSchedule.map(entry => rewinding ? LOW_ALPHA : holdAlphaAt(elapsed, entry.offsetMs, holdWindow, fadeWindow));
+
+  let highlightPos = 0;
+  for (let p = 1; p < alphas.length; p++) {
+    if (alphas[p] > alphas[highlightPos]) highlightPos = p;
   }
-  const momentIndex = momentPos >= 0 ? playbackSchedule[momentPos].index : -1;
+  const highlighted = alphas[highlightPos] > LOW_ALPHA;
+  const highlightIndex = highlighted ? playbackSchedule[highlightPos].index : -1;
 
-  updateDebugTimeDisplay(elapsed, momentIndex);
+  updateDebugTimeDisplay(elapsed, highlightIndex);
 
-  // While an image is in its own moment, the camera must be at exactly that
-  // image's keyframe pose — not the generically time-interpolated one, which
-  // is still travelling toward it for almost all of the moment window and
-  // only exactly arrives at the single instant its offset is due. Using the
-  // interpolated pose throughout the window left the highlighted image
-  // mis-framed (cropped or margined) for most of its own flash.
-  const camPose = momentPos >= 0 ? cameraKeyframes[momentPos] : getCameraPose();
+  // The camera is always continuously interpolating between keyframes,
+  // independent of which image (if any) is currently held at full opacity —
+  // it keeps moving throughout every hold window rather than freezing on a
+  // single keyframe, and only actually comes to rest during the real
+  // end-of-sequence pause (getCameraPose() naturally settles on the last
+  // keyframe there, since elapsed is pushed beyond every keyframe's time).
+  const camPose = getCameraPose();
   if (camPose) {
     camera(
       camPose.eye[0], camPose.eye[1], camPose.eye[2],
@@ -434,28 +447,26 @@ function draw() {
       drawingContext.depthMask(false);
 
       for (let p = 0; p < playbackSchedule.length; p++) {
+        if (p === highlightPos) continue;
         const entry = playbackSchedule[p];
         const image = mediaElement.children[entry.index].querySelector(imageSelector);
         if (!image) continue;
 
-        if (entry.index !== momentIndex) {
-          push();
-            tint(255, 255 * 0.2);
-            const t = stripShear(getImageTransformFromElement(image, true));
-            drawProjectedImage(image, 0, 0, t, -p);
-          pop();
-        }
+        push();
+          tint(255, 255 * alphas[p]);
+          const t = stripShear(getImageTransformFromElement(image, true));
+          drawProjectedImage(image, 0, 0, t, -p);
+        pop();
       }
 
-      if (momentIndex >= 0) {
-        const image = mediaElement.children[momentIndex].querySelector(imageSelector);
-        if (image) {
-          push();
-            tint(255, 255);
-            const t = stripShear(getImageTransformFromElement(image, true));
-            drawProjectedImage(image, 0, 0, t, 0);
-          pop();
-        }
+      const highlightEntry = playbackSchedule[highlightPos];
+      const highlightImage = highlightEntry && mediaElement.children[highlightEntry.index].querySelector(imageSelector);
+      if (highlightImage) {
+        push();
+          tint(255, 255 * alphas[highlightPos]);
+          const t = stripShear(getImageTransformFromElement(highlightImage, true));
+          drawProjectedImage(highlightImage, 0, 0, t, 0);
+        pop();
       }
 
       drawingContext.depthMask(true);
@@ -951,16 +962,34 @@ function isRewinding() {
   return realElapsed >= realExtendedTravelDuration + PLAYBACK_END_PAUSE_MS;
 }
 
+// Alpha (0..1) for one image at the given elapsed time: LOW_ALPHA before its
+// own offset, jumping instantly to full opacity right at that offset (no
+// fade-in), holding at 1, then ramping back down to LOW_ALPHA over the last
+// fadeWindow before holdWindow ends — never brightening before the image's
+// own scheduled moment, only after.
+function holdAlphaAt(elapsed, offsetMs, holdWindow, fadeWindow) {
+  if (elapsed < offsetMs || elapsed >= offsetMs + holdWindow) return LOW_ALPHA;
+
+  const t = elapsed - offsetMs;
+  let frac = 1;
+  if (t > holdWindow - fadeWindow) {
+    frac = (holdWindow - t) / fadeWindow;
+  }
+  frac = constrain(frac, 0, 1);
+
+  return LOW_ALPHA + (1 - LOW_ALPHA) * frac;
+}
+
 // Writes the current playback clock to a plain DOM element outside the
 // canvas (#debug-time), so timing can be read directly off the page rather
 // than inferred from what's rendered.
-function updateDebugTimeDisplay(elapsed, momentIndex) {
+function updateDebugTimeDisplay(elapsed, highlightIndex) {
   const el = document.getElementById('debug-time');
   if (!el) return;
 
   const phase = isPaused ? 'paused' : (isRewinding() ? 'rewinding' : 'forward');
-  const momentLabel = momentIndex >= 0 ? `#${momentIndex}` : 'none';
-  el.textContent = `elapsed: ${elapsed.toFixed(0)}ms | phase: ${phase} | in moment: ${momentLabel}`;
+  const highlightLabel = highlightIndex >= 0 ? `#${highlightIndex}` : 'none';
+  el.textContent = `elapsed: ${elapsed.toFixed(0)}ms | speed: ${PLAYBACK_SPEED}x | phase: ${phase} | highlighted: ${highlightLabel}`;
 }
 
 // Alignment homographies carry a small amount of shear — estimation noise,
