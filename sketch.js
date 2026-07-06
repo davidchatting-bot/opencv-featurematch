@@ -1,10 +1,4 @@
-const identityMatrix = [
-  1, 0, 0, 0,
-  0, 1, 0, 0,
-  0, 0, 1, 0,
-  0, 0, 0, 1
-];
-
+// identityMatrix now lives in imgproc.js
 const imageTransforms = [];
 let mediaBoundingBox = null;
 
@@ -17,10 +11,17 @@ const EARLY_EXIT_INLIER_THRESHOLD = 50;
 let maskSegmentation = null;
 
 // Real-time playback of the capture sequence, driven by each image's EXIF timestamp.
+const PLAYBACK_START_PAUSE_MS = 3000;
 const PLAYBACK_END_PAUSE_MS = 3000;
-const PLAYBACK_SPEED = 0.1; // 1 = real-time (matches original capture pace), 0.1 = one-tenth speed
+const PLAYBACK_SPEED = 0.5; // 1 = real-time (matches original capture pace), 0.5 = half speed
 let playbackSchedule = [];
 let playbackStartMillis = 0;
+
+// The image currently shown in full colour — whichever most recently started
+// its own hold. It persists (rather than reverting) once its hold/fade ends,
+// until the next image's hold begins and takes over. Every other image still
+// shows, desaturated, in the background (see draw()).
+let currentDisplayIndex = -1;
 
 // Space bar pauses/resumes playback. Pausing just freezes the clock that
 // drives everything else (getPlaybackElapsedMs) rather than touching
@@ -53,7 +54,7 @@ const HOLD_MS = 500;
 const FADE_MS = 150;
 
 // The constant background level every image sits at outside its own hold window.
-const LOW_ALPHA = 0.2;
+const LOW_ALPHA = 0.1;
 
 // 3D camera fly-through: one keyframe per aligned image, framing that image
 // alone, timed to the exact same clock as playbackSchedule above — the camera
@@ -112,16 +113,38 @@ function onFileDropped(file) {
   });
 }
 
+function setImageTransform(element, transform) {
+  if (element && Array.isArray(transform)) {
+    element.setAttribute('data-transform', JSON.stringify(transform));
+  }
+}
+
+function getImageTransformFromElement(element, traverse = false) {
+  let result = null;
+
+  if (element) {
+    const b = traverse ? (getImageTransformFromElement(element.parentElement, false) || identityMatrix) : identityMatrix;
+    try {
+      result = JSON.parse(element.getAttribute('data-transform'));
+    }
+    catch (e) {
+    }
+    if (result) result = multiplyMatrix4x4(b, result);
+  }
+
+  return result;
+}
+
 function generateLowResImage(imgElement, onloaded = () => {}) {
   let lowresImg = null;
 
   const lowresMaxPixels = 1024 * 768;
-  if (imgElement.width * imgElement.height > lowresMaxPixels) { 
+  if (imgElement.width * imgElement.height > lowresMaxPixels) {
     const s = Math.sqrt(lowresMaxPixels / (imgElement.width * imgElement.height));
 
     const targetW = Math.round(imgElement.width * s);
     const targetH = Math.round(imgElement.height * s);
-    
+
     const canvas = document.createElement('canvas');
     canvas.width = targetW;
     canvas.height = targetH;
@@ -149,186 +172,151 @@ function generateLowResImage(imgElement, onloaded = () => {}) {
     setTimeout(onloaded, 0);
 
     // Attach identity transform (no scaling)
-    setImageTransform(lowresImg.elt, [
-      1, 0, 0, 0,
-      0, 1, 0, 0,
-      0, 0, 1, 0,
-      0, 0, 0, 1
-    ]);
+    setImageTransform(lowresImg.elt, identityMatrix);
   }
 
   return lowresImg;
 }
 
+// Helper: Promise version of generateLowResImage
+function generateLowResImageAsync(imgElement) {
+  return new Promise(resolve => {
+    const lowresImg = generateLowResImage(imgElement, () => resolve(lowresImg));
+  });
+}
+
+// Expects a ready MediaPipe SelfieSegmentation instance in the global `maskSegmentation`.
 function generateMask(imgElement, onloaded = () => {}) {
   let maskImg = createImg('', '');
 
   maskSegmentation.onResults(async (results) => {
-      const maskCanvas = document.createElement('canvas');
-      maskCanvas.width = results.segmentationMask.width;
-      maskCanvas.height = results.segmentationMask.height;
-      const ctx = maskCanvas.getContext('2d');
-      
-      // flip horizontally
-      ctx.translate(maskCanvas.width, 0);
-      ctx.scale(-1, 1);
-      ctx.drawImage(results.segmentationMask, 0, 0);
+    const maskCanvas = document.createElement('canvas');
+    maskCanvas.width = results.segmentationMask.width;
+    maskCanvas.height = results.segmentationMask.height;
+    const ctx = maskCanvas.getContext('2d');
 
-      // convert red-channel mask to greyscale (copy R to G and B)
-      const imageData = ctx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
-      const data = imageData.data;
-      for (let i = 0; i < data.length; i += 4) {
-        const r = data[i];     // red channel holds the mask value
-        data[i]     = r;       // R (keep)
-        data[i + 1] = r;       // G (copy from R)
-        data[i + 2] = r;       // B (copy from R)
-      }
-      ctx.putImageData(imageData, 0, 0);
-      setImageTransform(maskImg.elt, getImageTransformFromElement(imgElement));
+    // flip horizontally
+    ctx.translate(maskCanvas.width, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(results.segmentationMask, 0, 0);
 
-      maskImg.elt.onload = onloaded;
-      maskImg.elt.src = maskCanvas.toDataURL();
-    });
-    maskSegmentation.send({ image: imgElement });
-
-    return(maskImg);
-}
-
-function processHomography(id) {
-  const selector = '.background';
-  const mediaCollection = select('#media')?.elt.querySelectorAll(selector);
-  if (!mediaCollection || mediaCollection.length === 0) return;
-
-  const n = mediaCollection.length;
-
-  if (n === 1) {
-    setImageTransform(mediaCollection[0].parentElement, identityMatrix);
-    return;
-  }
-
-  // The newest image is the last one
-  const image_b = mediaCollection[n - 1];
-
-  // Skip if already aligned
-  if (getImageTransformFromElement(image_b.parentElement)) return;
-
-  // Try all previously aligned images and pick the best match by inlier count
-  let bestInliers = 0;
-  let bestT0B = null;
-  let bestMatchId = null;
-
-  for (let i = n - 2; i >= 0; i--) {
-    const image_a = mediaCollection[i];
-    const t0A = getImageTransformFromElement(image_a.parentElement);
-
-    // Skip images that haven't been aligned yet
-    if (!t0A) continue;
-
-    console.log('*** trying align ', image_a.parentElement.id, image_b.parentElement.id);
-    Align_img(image_a, image_b);
-
-    const inlierCount = (good_inlier_matches && good_inlier_matches.size) ? good_inlier_matches.size() : 0;
-
-    if (h && !h.empty() && h.data64F) {
-      const check = isReasonableHomography(Array.from(h.data64F));
-      console.log('Homography check:', check, 'inliers:', inlierCount);
-
-      if (check.valid && inlierCount > bestInliers) {
-        const tab = [
-          h.data64F[0], h.data64F[1], 0, h.data64F[2],
-          h.data64F[3], h.data64F[4], 0, h.data64F[5],
-          0, 0, 1, 0,
-          h.data64F[6], h.data64F[7], 0, h.data64F[8]
-        ];
-
-        const tAa = getImageTransformFromElement(image_a);
-        const tBb = getImageTransformFromElement(image_b);
-        const tBb_i = invertMatrix4x4(tBb);
-        const tAB = multiplyMatrix4x4(multiplyMatrix4x4(tAa, tab), tBb_i);
-
-        bestT0B = multiplyMatrix4x4(t0A, tAB);
-        bestInliers = inlierCount;
-        bestMatchId = image_a.parentElement.id;
-
-        // Candidates are tried nearest-in-time first (i counts down from n-2),
-        // so a confident match here is very likely the best one available —
-        // stop searching rather than aligning against every earlier frame too.
-        if (bestInliers >= EARLY_EXIT_INLIER_THRESHOLD) {
-          console.log('Early exit: accepting', bestMatchId, 'with', bestInliers, 'inliers (>=', EARLY_EXIT_INLIER_THRESHOLD, ')');
-          break;
-        }
-      } else if (!check.valid) {
-        console.warn('Rejecting homography with', image_a.parentElement.id, ':', check.reason);
-      }
+    // convert red-channel mask to greyscale (copy R to G and B)
+    const imageData = ctx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
+    const data = imageData.data;
+    for (let i = 0; i < data.length; i += 4) {
+      const r = data[i];     // red channel holds the mask value
+      data[i]     = r;       // R (keep)
+      data[i + 1] = r;       // G (copy from R)
+      data[i + 2] = r;       // B (copy from R)
     }
-  }
+    ctx.putImageData(imageData, 0, 0);
+    setImageTransform(maskImg.elt, getImageTransformFromElement(imgElement));
 
-  if (bestT0B) {
-    console.log('Best match for', image_b.parentElement.id, ':', bestMatchId, 'with', bestInliers, 'inliers');
-    setImageTransform(image_b.parentElement, bestT0B);
-  } else {
-    console.warn('No valid homography found for', image_b.parentElement.id);
-  }
+    maskImg.elt.onload = onloaded;
+    maskImg.elt.src = maskCanvas.toDataURL();
+  });
+  maskSegmentation.send({ image: imgElement });
+
+  return (maskImg);
 }
 
-// cache for converted images (HTMLImageElement -> p5.Graphics)
-const textureCache = new WeakMap();
-
-function getTextureFromElement(el) {
-  if (!el) return null;
-
-  // Use natural pixel dimensions, not the CSS-rendered box size — el.width/height
-  // reflect layout (and go wrong if #media's display/sizing CSS changes), while
-  // naturalWidth/naturalHeight are the actual decoded image dimensions.
-  const w = el.naturalWidth || el.width;
-  const h = el.naturalHeight || el.height;
-
-  // check cache first
-  if (textureCache.has(el)) {
-    const cached = textureCache.get(el);
-    // check if image size changed (unlikely but safe)
-    if (cached.width === w && cached.height === h) {
-      return cached;
-    }
-    // size changed, remove old and recreate
-    cached.remove();
-  }
-
-  // convert HTMLImageElement to p5.Graphics
-  const g = createGraphics(w, h);
-  g.drawingContext.drawImage(el, 0, 0);
-  textureCache.set(el, g);
-  return g;
+// Helper: Promise version of generateMask
+function generateMaskAsync(imgElement) {
+  return new Promise(resolve => {
+    const maskImg = generateMask(imgElement, () => resolve(maskImg));
+  });
 }
 
-// draw a textured quad: srcImg projected by homography Hproj into target image space (targetIndex)
-function drawProjectedImage(srcImg, x, y, Hproj, zDepth = 0) {
-  if (!srcImg || !Hproj) return;
-  
-  const img = getTextureFromElement(srcImg);
-  if (!img) return;
-  
-  const w = img.width, h = img.height;
-  const corners = [0,0,w,0,w,h,0,h];
-  // project corners into target image pixel coords (corners is a flat array [x0,y0,...])
-  const dst = [];
-  for (let i = 0; i < corners.length; i += 2) {
-    const p = applyTransform4x4(corners[i], corners[i + 1], Hproj) || [0, 0];
-    dst.push(p[0]+x, p[1]+y);
+/**
+ * Creates a new image element with the mask applied.
+ * Pixels where the mask is dark (black) become transparent.
+ * @param {HTMLImageElement|p5.Element} colorImg - the colour image
+ * @param {HTMLImageElement|p5.Element} maskImg - the greyscale mask (white = keep, black = transparent)
+ * @returns {p5.Element} - a new p5 img element containing the masked image
+ */
+function applyMaskToImage(colorImg, maskImg, invert = false, onloaded = () => {}) {
+  let resultImg = createImg('', '');
+
+  const w = colorImg.naturalWidth || colorImg.width;
+  const h = colorImg.naturalHeight || colorImg.height;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+  ctx.drawImage(colorImg, 0, 0, w, h);
+
+  const colorData = ctx.getImageData(0, 0, w, h);
+  const cPixels = colorData.data;
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.drawImage(maskImg, 0, 0, w, h);
+  const maskData = ctx.getImageData(0, 0, w, h);
+  const mPixels = maskData.data;
+
+  for (let i = 0; i < cPixels.length; i += 4) {
+    const maskVal = invert ? 255 - mPixels[i] : mPixels[i];
+    cPixels[i] = maskVal > 0 ? cPixels[i] : random(255);
+    cPixels[i + 1] = maskVal > 0 ? cPixels[i + 1] : random(255);
+    cPixels[i + 2] = maskVal > 0 ? cPixels[i + 2] : random(255);
+    cPixels[i + 3] = maskVal;
   }
-  // draw textured polygon in WEBGL using normalized texture coords (0..1)
-  push();
-    noStroke();
-    texture(img);
-    beginShape();
-      // vertex(x, y, z, u, v)
-      vertex(dst[0], dst[1], zDepth, 0, 0);
-      vertex(dst[2], dst[3], zDepth, 1, 0);
-      vertex(dst[4], dst[5], zDepth, 1, 1);
-      vertex(dst[6], dst[7], zDepth, 0, 1);
-    endShape(CLOSE);
-  pop();
+
+  ctx.putImageData(colorData, 0, 0);
+  setImageTransform(resultImg.elt, getImageTransformFromElement(colorImg));
+
+  resultImg.elt.onload = onloaded;
+  resultImg.elt.src = canvas.toDataURL();
+
+  return resultImg;
 }
+
+// Helper: Promise version of applyMaskToImage
+function applyMaskToImageAsync(colorImg, maskImg, invert) {
+  return new Promise(resolve => {
+    const resultImg = applyMaskToImage(colorImg, maskImg, invert, () => resolve(resultImg));
+  });
+}
+
+// processHomography is defined further down. getTextureFromElement and
+// drawProjectedImage come from shimage.js (already loaded).
+
+// Cache of desaturated (greyscale) copies of images, keyed by the original
+// element — computed once and reused. tint() alone can only dim/tint a
+// texture, not actually desaturate it, so background images get a genuinely
+// greyscale copy drawn instead of the colour original. Uses a plain 2D
+// canvas pixel loop rather than p5's built-in filter(GRAY) on a
+// createGraphics() buffer — that threw a WebGL "useProgram" error and broke
+// the whole canvas, since it shares/conflicts with the main sketch's own
+// WEBGL context.
+const greyscaleCache = new WeakMap();
+
+function getGreyscaleElement(img) {
+  if (greyscaleCache.has(img)) return greyscaleCache.get(img);
+
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, w, h);
+
+  const imageData = ctx.getImageData(0, 0, w, h);
+  const data = imageData.data;
+  for (let i = 0; i < data.length; i += 4) {
+    const grey = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    data[i] = data[i + 1] = data[i + 2] = grey;
+  }
+  ctx.putImageData(imageData, 0, 0);
+
+  greyscaleCache.set(img, canvas);
+  return canvas;
+}
+
+// drawProjectedImage now lives in shimage.js
 
 function upsertMedia(id) {
   if (!id) return null;
@@ -401,13 +389,11 @@ function draw() {
   const scheduledIndices = playbackSchedule.map(e => e.index);
   mediaBoundingBox = getBoundingBox(imageSelector, scheduledIndices);
 
-  // Every image shows at a constant low alpha all the time (a translucent
-  // overlapping "stack"), fading smoothly up to full opacity and back down
-  // again around its own scheduled moment (never before it, only after) —
-  // whichever image is currently brightest is drawn last so it stands out
-  // crisply on top rather than being dulled by another overlay. Rewind never
-  // highlights any image — it's just the camera travelling back to the
-  // start, not a second forward playthrough.
+  // The most recently active image fades smoothly up to full colour opacity
+  // right as its own scheduled moment begins (never before), then back down
+  // to LOW_ALPHA, and simply persists highlighted once its own fade ends
+  // until the next image's hold takes over. Rewind never starts a new hold —
+  // it's just the camera travelling back to the start.
   const elapsed = getPlaybackElapsedMs();
   const rewinding = isRewinding();
   const holdWindow = HOLD_MS * PLAYBACK_SPEED;
@@ -420,9 +406,9 @@ function draw() {
     if (alphas[p] > alphas[highlightPos]) highlightPos = p;
   }
   const highlighted = alphas[highlightPos] > LOW_ALPHA;
-  const highlightIndex = highlighted ? playbackSchedule[highlightPos].index : -1;
+  if (highlighted) currentDisplayIndex = playbackSchedule[highlightPos].index;
 
-  updateDebugTimeDisplay(elapsed, highlightIndex);
+  updateDebugTimeDisplay(elapsed, highlighted ? currentDisplayIndex : -1);
 
   // The camera is always continuously interpolating between keyframes,
   // independent of which image (if any) is currently held at full opacity —
@@ -439,34 +425,39 @@ function draw() {
     );
   }
 
-  // Depth writes are disabled throughout — otherwise the nearer quad's depth
-  // value would block farther ones from blending through underneath it.
+  // Every other (unhighlighted) image still shows in the background, but
+  // desaturated to greyscale at the constant low alpha, so the current
+  // highlighted image (full colour) reads clearly as "the one in focus".
+  // Depth writes are disabled — otherwise the nearer quad's depth value
+  // would block farther ones from blending through underneath it.
   const mediaElement = select('#media')?.elt;
-  if(mediaElement) {
+  if (mediaElement) {
     push();
       drawingContext.depthMask(false);
 
       for (let p = 0; p < playbackSchedule.length; p++) {
-        if (p === highlightPos) continue;
         const entry = playbackSchedule[p];
+        if (entry.index === currentDisplayIndex) continue;
         const image = mediaElement.children[entry.index].querySelector(imageSelector);
         if (!image) continue;
 
         push();
-          tint(255, 255 * alphas[p]);
+          tint(255, 255 * LOW_ALPHA);
           const t = stripShear(getImageTransformFromElement(image, true));
-          drawProjectedImage(image, 0, 0, t, -p);
+          drawProjectedImage(getGreyscaleElement(image), 0, 0, t, -p);
         pop();
       }
 
-      const highlightEntry = playbackSchedule[highlightPos];
-      const highlightImage = highlightEntry && mediaElement.children[highlightEntry.index].querySelector(imageSelector);
-      if (highlightImage) {
-        push();
-          tint(255, 255 * alphas[highlightPos]);
-          const t = stripShear(getImageTransformFromElement(highlightImage, true));
-          drawProjectedImage(highlightImage, 0, 0, t, 0);
-        pop();
+      if (currentDisplayIndex >= 0) {
+        const pos = playbackSchedule.findIndex(e => e.index === currentDisplayIndex);
+        const image = mediaElement.children[currentDisplayIndex].querySelector(imageSelector);
+        if (image) {
+          push();
+            tint(255, 255 * (pos >= 0 ? alphas[pos] : LOW_ALPHA));
+            const t = stripShear(getImageTransformFromElement(image, true));
+            drawProjectedImage(image, 0, 0, t, 0);
+          pop();
+        }
       }
 
       drawingContext.depthMask(true);
@@ -474,267 +465,8 @@ function draw() {
   }
 }
 
-function applyTransform4x4(px, py, M) {
-  // strict: accept only flat row-major 4x4 arrays (length 16)
-  if (!Array.isArray(M) || M.length !== 16) return [px, py];
-
-  const X = M[0] * px + M[1] * py + M[2] * 0 + M[3];
-  const Y = M[4] * px + M[5] * py + M[6] * 0 + M[7];
-  const W = M[12] * px + M[13] * py + M[14] * 0 + M[15];
-
-  if (!isFinite(W) || Math.abs(W) < 1e-12) return [X, Y];
-  return [X / W, Y / W];
-}
-
-/**
- * Creates a new image element with the mask applied.
- * Pixels where the mask is dark (black) become transparent.
- * @param {HTMLImageElement|p5.Element} colorImg - the colour image
- * @param {HTMLImageElement|p5.Element} maskImg - the greyscale mask (white = keep, black = transparent)
- * @returns {p5.Element} - a new p5 img element containing the masked image
- */
-function applyMaskToImage(colorImg, maskImg, invert = false, onloaded = () => {}) {
-  let resultImg = createImg('', '');
-
-  const w = colorImg.naturalWidth || colorImg.width;
-  const h = colorImg.naturalHeight || colorImg.height;
-
-  const canvas = document.createElement('canvas');
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-
-  ctx.drawImage(colorImg, 0, 0, w, h);
-
-  const colorData = ctx.getImageData(0, 0, w, h);
-  const cPixels = colorData.data;
-
-  ctx.clearRect(0, 0, w, h);
-  ctx.drawImage(maskImg, 0, 0, w, h);
-  const maskData = ctx.getImageData(0, 0, w, h);
-  const mPixels = maskData.data;
-
-  for (let i = 0; i < cPixels.length; i += 4) {
-    const maskVal = invert ? 255 - mPixels[i] : mPixels[i];
-    cPixels[i] = maskVal > 0 ? cPixels[i] : random(255);
-    cPixels[i + 1] = maskVal > 0 ? cPixels[i + 1] : random(255);
-    cPixels[i + 2] = maskVal > 0 ? cPixels[i + 2] : random(255);
-    cPixels[i + 3] = maskVal;
-  }
-
-  ctx.putImageData(colorData, 0, 0);
-  setImageTransform(resultImg.elt, getImageTransformFromElement(colorImg));
-
-  resultImg.elt.onload = onloaded;
-  resultImg.elt.src = canvas.toDataURL();
-
-  return resultImg;
-}
-
-/**
- * Checks if a homography transform looks reasonable.
- * Returns { valid: boolean, reason: string, rotation: number, scale: number, shear: number }
- * 
- * A "reasonable" homography for image alignment should have:
- * - Minimal rotation (< maxRotationDeg)
- * - Scale close to 1 (within scaleRange)
- * - Low shear
- * - Low perspective distortion (bottom row close to [0, 0, 1])
- * 
- * @param {Array} H - flat 9-element row-major 3x3 homography, or flat 16-element 4x4
- * @param {Object} options - optional thresholds
- * @returns {Object} { valid, reason, rotation, scale, shear, perspective }
- */
-function isReasonableHomography(H, options = {}) {
-  const {
-    maxRotationDeg = 15,      // max allowed rotation in degrees
-    minScale = 0.5,           // min allowed scale
-    maxScale = 2.0,           // max allowed scale
-    maxShear = 0.3,           // max allowed shear
-    maxPerspective = 0.001    // max allowed perspective distortion
-  } = options;
-
-  if (!H) return { valid: false, reason: 'H is null or undefined' };
-
-  // extract 3x3 from flat 9 or flat 16
-  let h00, h01, h02, h10, h11, h12, h20, h21, h22;
-  if (H.length === 9) {
-    [h00, h01, h02, h10, h11, h12, h20, h21, h22] = H;
-  } else if (H.length === 16) {
-    // 4x4 row-major: extract the 2D affine/projective part
-    h00 = H[0];  h01 = H[1];  h02 = H[3];   // skip H[2] (z column)
-    h10 = H[4];  h11 = H[5];  h12 = H[7];
-    h20 = H[12]; h21 = H[13]; h22 = H[15];
-  } else {
-    return { valid: false, reason: 'H must be length 9 or 16' };
-  }
-
-  // normalize so h22 = 1 (if possible)
-  if (Math.abs(h22) < 1e-12) {
-    return { valid: false, reason: 'h22 is zero, degenerate homography' };
-  }
-  h00 /= h22; h01 /= h22; h02 /= h22;
-  h10 /= h22; h11 /= h22; h12 /= h22;
-  h20 /= h22; h21 /= h22; h22 = 1;
-
-  // perspective distortion: bottom row should be [0, 0, 1]
-  const perspective = Math.sqrt(h20 * h20 + h21 * h21);
-  if (perspective > maxPerspective) {
-    return {
-      valid: false,
-      reason: `Perspective distortion too high: ${perspective.toFixed(6)} > ${maxPerspective}`,
-      perspective
-    };
-  }
-
-  // decompose upper-left 2x2 into rotation, scale, shear
-  // H = [ a  b  tx ]   where [a b; c d] = R * S * Shear
-  //     [ c  d  ty ]
-  //     [ 0  0  1  ]
-  const a = h00, b = h01, c = h10, d = h11;
-
-  // scale: sqrt of determinant gives overall scale
-  const det = a * d - b * c;
-  if (det <= 0) {
-    return { valid: false, reason: 'Negative or zero determinant (flipped or degenerate)' };
-  }
-  const scale = Math.sqrt(det);
-
-  // rotation angle from the 2x2 matrix (assumes no/low shear)
-  // rotation = atan2(c, a) for a proper rotation matrix
-  const rotationRad = Math.atan2(c, a);
-  const rotationDeg = Math.abs(rotationRad * 180 / Math.PI);
-
-  // shear: measure how non-orthogonal the axes are
-  // shear ~ (a*b + c*d) / det for normalized matrix
-  const shear = Math.abs(a * b + c * d) / det;
-
-  // check thresholds
-  if (rotationDeg > maxRotationDeg) {
-    return {
-      valid: false,
-      reason: `Rotation too large: ${rotationDeg.toFixed(2)}° > ${maxRotationDeg}°`,
-      rotation: rotationDeg,
-      scale,
-      shear,
-      perspective
-    };
-  }
-
-  if (scale < minScale || scale > maxScale) {
-    return {
-      valid: false,
-      reason: `Scale out of range: ${scale.toFixed(3)} not in [${minScale}, ${maxScale}]`,
-      rotation: rotationDeg,
-      scale,
-      shear,
-      perspective
-    };
-  }
-
-  if (shear > maxShear) {
-    return {
-      valid: false,
-      reason: `Shear too high: ${shear.toFixed(3)} > ${maxShear}`,
-      rotation: rotationDeg,
-      scale,
-      shear,
-      perspective
-    };
-  }
-
-  return {
-    valid: true,
-    reason: 'OK',
-    rotation: rotationDeg,
-    scale,
-    shear,
-    perspective
-  };
-}
-
-/**
- * Multiplies two 4x4 row-major flat matrices and returns the result.
- * Result = A * B (A applied first, then B)
- * @param {Array} A - flat 16-element row-major 4x4 matrix
- * @param {Array} B - flat 16-element row-major 4x4 matrix
- * @returns {Array} - flat 16-element row-major 4x4 matrix (A * B)
- */
-function multiplyMatrix4x4(A, B) {
-  let result = null;
-
-  if (!A || A.length !== 16 || !B || B.length !== 16) {
-  }
-  else {
-    result = new Array(16);
-
-    for (let row = 0; row < 4; row++) {
-      for (let col = 0; col < 4; col++) {
-        let sum = 0;
-        for (let k = 0; k < 4; k++) {
-          sum += A[row * 4 + k] * B[k * 4 + col];
-        }
-        result[row * 4 + col] = sum;
-      }
-    }
-  }
-
-  return result;
-}
-
-function invertMatrix4x4(A) {
-  const inv = new Array(16);
-  const det = determinant4x4(A);
-  if (det === 0) {
-    return null;
-  }
-  for (let i = 0; i < 4; i++) {
-    for (let j = 0; j < 4; j++) {
-      inv[j * 4 + i] = cofactor4x4(A, i, j) / det;
-    }
-  }
-  return inv;
-}
-
-function determinant4x4(m) {
-  if (!m || m.length !== 16) return null;
-
-  // Helper for 3x3 determinant
-  function det3(a, b, c, d, e, f, g, h, i) {
-    return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
-  }
-
-  const m0 = m[0],  m1 = m[1],  m2 = m[2],  m3 = m[3],
-        m4 = m[4],  m5 = m[5],  m6 = m[6],  m7 = m[7],
-        m8 = m[8],  m9 = m[9],  m10 = m[10], m11 = m[11],
-        m12 = m[12], m13 = m[13], m14 = m[14], m15 = m[15];
-
-  return (
-    m0 * det3(m5, m6, m7,  m9, m10, m11,  m13, m14, m15)
-    - m1 * det3(m4, m6, m7,  m8, m10, m11,  m12, m14, m15)
-    + m2 * det3(m4, m5, m7,  m8, m9, m11,  m12, m13, m15)
-    - m3 * det3(m4, m5, m6,  m8, m9, m10,  m12, m13, m14)
-  );
-}
-
-function cofactor4x4(m, row, col) {
-  // Build the 3x3 minor by skipping the given row and column
-  const minor = [];
-  for (let i = 0; i < 4; i++) {
-    if (i === row) continue;
-    for (let j = 0; j < 4; j++) {
-      if (j === col) continue;
-      minor.push(m[i * 4 + j]);
-    }
-  }
-  // Compute the determinant of the 3x3 minor
-  const det =
-    minor[0] * (minor[4] * minor[8] - minor[5] * minor[7]) -
-    minor[1] * (minor[3] * minor[8] - minor[5] * minor[6]) +
-    minor[2] * (minor[3] * minor[7] - minor[4] * minor[6]);
-  // Apply the checkerboard sign
-  return ((row + col) % 2 === 0 ? 1 : -1) * det;
-}
+// applyTransform4x4, applyMaskToImage(+Async), isReasonableHomography, and the
+// 4x4 matrix helpers (multiply/invert/determinant/cofactor) now live in imgproc.js
 
 function keyPressed() {
   if (key === 'x' || key === 'X') {
@@ -830,6 +562,75 @@ function compareImagesForSequence(imgA, imgB) {
   return imgA.src.localeCompare(imgB.src);
 }
 
+/**
+ * Aligns the newest image in a '.background'-tagged media collection against
+ * the best-matching (by RANSAC inlier count) previously-aligned image, trying
+ * candidates nearest-in-time first and stopping early once a confident match
+ * is found. Writes the resulting 4x4 transform onto the new image's container
+ * via setImageTransform. This search strategy (which candidate to try first,
+ * when to stop) is a RugbySynth-specific policy, not part of the generic
+ * imgproc.js library.
+ */
+function processHomography(id) {
+  const selector = '.background';
+  const mediaCollection = select('#media')?.elt.querySelectorAll(selector);
+  if (!mediaCollection || mediaCollection.length === 0) return;
+
+  const n = mediaCollection.length;
+
+  if (n === 1) {
+    setImageTransform(mediaCollection[0].parentElement, identityMatrix);
+    return;
+  }
+
+  // The newest image is the last one
+  const image_b = mediaCollection[n - 1];
+
+  // Skip if already aligned
+  if (getImageTransformFromElement(image_b.parentElement)) return;
+
+  // Try all previously aligned images and pick the best match by inlier count
+  let bestInliers = 0;
+  let bestT0B = null;
+  let bestMatchId = null;
+
+  for (let i = n - 2; i >= 0; i--) {
+    const image_a = mediaCollection[i];
+    const t0A = getImageTransformFromElement(image_a.parentElement);
+
+    // Skip images that haven't been aligned yet
+    if (!t0A) continue;
+
+    const result = alignImagePair(image_a, image_b);
+
+    if (result.valid && result.inliers > bestInliers) {
+      const tAa = getImageTransformFromElement(image_a);
+      const tBb = getImageTransformFromElement(image_b);
+      const tBb_i = invertMatrix4x4(tBb);
+      const tAB = multiplyMatrix4x4(multiplyMatrix4x4(tAa, result.transform), tBb_i);
+
+      bestT0B = multiplyMatrix4x4(t0A, tAB);
+      bestInliers = result.inliers;
+      bestMatchId = image_a.parentElement.id;
+
+      // Candidates are tried nearest-in-time first (i counts down from n-2),
+      // so a confident match here is very likely the best one available —
+      // stop searching rather than aligning against every earlier frame too.
+      if (bestInliers >= EARLY_EXIT_INLIER_THRESHOLD) {
+        break;
+      }
+    } else if (!result.valid) {
+      console.warn('Rejecting homography with', image_a.parentElement.id, ':', result.reason);
+    }
+  }
+
+  if (bestT0B) {
+    setImageTransform(image_b.parentElement, bestT0B);
+  } else {
+    console.warn('No valid homography found for', image_b.parentElement.id);
+  }
+}
+
 async function processAnyAttachedMedia() {
   const originals = selectAll('#media .original');
   // Wait for all images to load
@@ -908,23 +709,27 @@ function buildPlaybackSchedule() {
 const REWIND_SPEED_MULTIPLIER = 2;
 
 // Shared phase arithmetic for getPlaybackElapsedMs() and isRewinding(), all
-// using the pausable getEffectiveMillis() clock. Four phases:
-//  1. Forward: 0 -> lastOffset, scaled by PLAYBACK_SPEED.
-//  2. Extended forward: time keeps running normally (same PLAYBACK_SPEED
+// using the pausable getEffectiveMillis() clock. Five phases:
+//  1. Start-of-sequence pause: always PLAYBACK_START_PAUSE_MS of real
+//     wall-clock time regardless of speed — a beat before the first photo's
+//     hold begins, camera parked at the first keyframe, mirroring the pause
+//     at the end.
+//  2. Forward: 0 -> lastOffset, scaled by PLAYBACK_SPEED.
+//  3. Extended forward: time keeps running normally (same PLAYBACK_SPEED
 //     scaling, no special-casing) for a further HOLD_MS of real time past
 //     lastOffset — otherwise the last photo's hold window would be cut off
 //     the instant it's reached, while every other photo gets its full
 //     HOLD_MS afterward.
-//  3. End-of-sequence pause: always PLAYBACK_END_PAUSE_MS of real wall-clock
+//  4. End-of-sequence pause: always PLAYBACK_END_PAUSE_MS of real wall-clock
 //     time regardless of speed.
-//  4. Rewind: lastOffset -> 0, at REWIND_SPEED_MULTIPLIER x the forward speed.
+//  5. Rewind: lastOffset -> 0, at REWIND_SPEED_MULTIPLIER x the forward speed.
 function getPlaybackPhaseInfo() {
   const lastOffset = playbackSchedule[playbackSchedule.length - 1].offsetMs;
   const realTravelDuration = lastOffset / PLAYBACK_SPEED;
   const realExtendedTravelDuration = realTravelDuration + HOLD_MS;
   const rewindSpeed = PLAYBACK_SPEED * REWIND_SPEED_MULTIPLIER;
   const realRewindDuration = lastOffset / rewindSpeed;
-  const realCycleLength = realExtendedTravelDuration + PLAYBACK_END_PAUSE_MS + realRewindDuration;
+  const realCycleLength = PLAYBACK_START_PAUSE_MS + realExtendedTravelDuration + PLAYBACK_END_PAUSE_MS + realRewindDuration;
   const realElapsed = (getEffectiveMillis() - playbackStartMillis) % realCycleLength;
 
   return { lastOffset, realExtendedTravelDuration, rewindSpeed, realCycleLength, realElapsed };
@@ -932,24 +737,32 @@ function getPlaybackPhaseInfo() {
 
 // Elapsed time (ms) within the current looping playback cycle, in the same
 // units as playbackSchedule's offsetMs — shared by image-frame selection and
-// camera keyframe animation so the two always stay in lockstep. After the
-// extended-forward phase, elapsed is pushed far past lastOffset so the last
-// image's moment window (already closed naturally) stays closed for the
-// pause (screen blank, camera holds) instead of staying lit throughout.
+// camera keyframe animation so the two always stay in lockstep. During the
+// start pause, elapsed is pushed far negative so nothing is highlighted yet
+// (camera holds at keyframe 0). After the extended-forward phase, elapsed is
+// pushed far past lastOffset so the last image's moment window (already
+// closed naturally) stays closed for the end pause (screen blank, camera
+// holds) instead of staying lit throughout.
 function getPlaybackElapsedMs() {
   if (playbackSchedule.length === 0) return 0;
 
   const { lastOffset, realExtendedTravelDuration, rewindSpeed, realElapsed } = getPlaybackPhaseInfo();
 
-  if (realElapsed < realExtendedTravelDuration) {
-    return realElapsed * PLAYBACK_SPEED;
+  if (realElapsed < PLAYBACK_START_PAUSE_MS) {
+    return -1e6; // before any moment window — blank, camera holds at keyframe 0
   }
 
-  if (realElapsed < realExtendedTravelDuration + PLAYBACK_END_PAUSE_MS) {
+  const realForwardElapsed = realElapsed - PLAYBACK_START_PAUSE_MS;
+
+  if (realForwardElapsed < realExtendedTravelDuration) {
+    return realForwardElapsed * PLAYBACK_SPEED;
+  }
+
+  if (realForwardElapsed < realExtendedTravelDuration + PLAYBACK_END_PAUSE_MS) {
     return lastOffset + 1e6; // far outside any moment window — blank, camera holds
   }
 
-  const rewindReal = realElapsed - realExtendedTravelDuration - PLAYBACK_END_PAUSE_MS;
+  const rewindReal = realForwardElapsed - realExtendedTravelDuration - PLAYBACK_END_PAUSE_MS;
   return lastOffset - rewindReal * rewindSpeed;
 }
 
@@ -959,7 +772,8 @@ function getPlaybackElapsedMs() {
 function isRewinding() {
   if (playbackSchedule.length === 0) return false;
   const { realExtendedTravelDuration, realElapsed } = getPlaybackPhaseInfo();
-  return realElapsed >= realExtendedTravelDuration + PLAYBACK_END_PAUSE_MS;
+  const realForwardElapsed = realElapsed - PLAYBACK_START_PAUSE_MS;
+  return realForwardElapsed >= realExtendedTravelDuration + PLAYBACK_END_PAUSE_MS;
 }
 
 // Alpha (0..1) for one image at the given elapsed time: LOW_ALPHA before its
@@ -992,29 +806,7 @@ function updateDebugTimeDisplay(elapsed, highlightIndex) {
   el.textContent = `elapsed: ${elapsed.toFixed(0)}ms | speed: ${PLAYBACK_SPEED}x | phase: ${phase} | highlighted: ${highlightLabel}`;
 }
 
-// Alignment homographies carry a small amount of shear — estimation noise,
-// since a real photo can't physically shear relative to another shot of the
-// same static scene — which renders as a slightly parallelogram-shaped image
-// rather than a clean rectangle. Reconstructs a shear-free rotation + uniform
-// scale + translation transform from the real one, using the top edge (a,c)
-// as the source of truth (matching computeCameraKeyframeForImage's own
-// rotation convention) and discarding the left edge's independent shear.
-function stripShear(transform) {
-  if (!transform) return transform;
-
-  const a = transform[0], c = transform[4];
-  const tx = transform[3], ty = transform[7];
-
-  const scale = Math.hypot(a, c) || 1;
-  const cosT = a / scale, sinT = c / scale;
-
-  return [
-    scale * cosT, -scale * sinT, 0, tx,
-    scale * sinT,  scale * cosT, 0, ty,
-    0, 0, 1, 0,
-    0, 0, 0, 1
-  ];
-}
+// stripShear now lives in imgproc.js
 
 // Fits a single image edge-to-edge ("square" to the camera) into a
 // perspective camera's view, deriving size/center/roll directly from its own
@@ -1175,48 +967,4 @@ async function processImage(originalImgElement, div) {
   foregroundImg.addClass('foreground');
   backgroundImg.parent(div);
   backgroundImg.addClass('background');
-}
-
-// Helper: Promise version of generateLowResImage
-function generateLowResImageAsync(imgElement) {
-  return new Promise(resolve => {
-    const lowresImg = generateLowResImage(imgElement, () => resolve(lowresImg));
-  });
-}
-
-// Helper: Promise version of generateMask
-function generateMaskAsync(imgElement) {
-  return new Promise(resolve => {
-    const maskImg = generateMask(imgElement, () => resolve(maskImg));
-  });
-}
-
-// Helper: Promise version of applyMaskToImage
-function applyMaskToImageAsync(colorImg, maskImg, invert) {
-  return new Promise(resolve => {
-    const resultImg = applyMaskToImage(colorImg, maskImg, invert, () => resolve(resultImg));
-  });
-}
-
-function setImageTransform(element, transform) {
-  console.log('setImageTransform', element, transform);
-  if (element && Array.isArray(transform)) {
-    element.setAttribute('data-transform', JSON.stringify(transform));
-  }
-}
-
-function getImageTransformFromElement(element, traverse = false) {
-  let result = null;
-
-  if (element){
-    const b = traverse ? (getImageTransformFromElement(element.parentElement, false) || identityMatrix) : identityMatrix;
-    try {
-      result = JSON.parse(element.getAttribute('data-transform'));
-    }
-    catch (e) {
-    }
-    if(result) result = multiplyMatrix4x4(b, result);
-  }
-
-  return result;
 }

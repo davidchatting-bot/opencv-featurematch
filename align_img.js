@@ -9,7 +9,7 @@ var good_matches_global = null; // store matches so draw() can render them
 function Align_img(image_element_a, image_element_b) {
     if(!image_element_a || !image_element_b) return null;
 
-   //Based on: https://scottsuhy.com/2021/02/01/image-alignment-feature-based-in-opencv-js-javascript/
+   //Based on: https://web.archive.org/web/20210201184709/https://scottsuhy.com/2021/02/01/image-alignment-feature-based-in-opencv-js-javascript/ (original now dead)
    // reset previous state so repeated presses don't append results
    points1 = [];
    points2 = [];
@@ -138,8 +138,7 @@ function Align_img(image_element_a, image_element_b) {
           }
       }
       if(good_matches.size() <= 3){
-          alert("Less than 4 good matches found! counter =" + good_matches.size() + " try changing distance.");
-          return;
+          throw new Error("Less than 4 good matches found! counter =" + good_matches.size() + " try changing distance.");
       }
   }
   else if(match_option == 1) { //knnMatch
@@ -162,8 +161,7 @@ function Align_img(image_element_a, image_element_b) {
           }
       }
       if(counter <= 3){
-          alert("Less than 4 good matches found! Counter=" + counter + " try changing distance %. It's currently " + knnDistance_option);
-          return;
+          throw new Error("Less than 4 good matches found! Counter=" + counter + " try changing distance %. It's currently " + knnDistance_option);
       }
       console.log("keeping ", counter, " points in good_matches vector out of ", matches.size(), " contained in this match vector:", matches);
       console.log("here are first 5 matches");
@@ -241,8 +239,7 @@ function Align_img(image_element_a, image_element_b) {
   h = cv.findHomography(mat1, mat2, cv.RANSAC, 3, findHomographyMask);
    if (h.empty())
    {
-       alert("homography matrix empty!");
-       return;
+       throw new Error("homography matrix empty!");
    }
    else{
       console.log("h:", h);
@@ -399,19 +396,4 @@ console.log("   depth:" + depth + " colorspace:" + baseline_colorspace + " type:
 return;
 }
 
-function cvMatToP5Image(mat, image) {
-  //mat to canvas
-  let tempCanvas = document.createElement('canvas');
-  tempCanvas.id = 'tempCanvas';
-  tempCanvas.classList.add('hide');
-  document.body.appendChild(tempCanvas);
-  
-  let resultSize = mat.size();
-  tempCanvas.width = resultSize.width;
-  tempCanvas.height = resultSize.height
-  
-  cv.imshow('tempCanvas', mat);
-  
-  canvasToP5Image(tempCanvas, image, { flipX: false, flipY: false });
-  tempCanvas.remove();
-}
+// cvMatToP5Image now lives in shimage.js
