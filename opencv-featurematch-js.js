@@ -623,7 +623,7 @@ function isReasonableHomography(H, options = {}) {
     maxRotationDeg = 15,      // max allowed rotation in degrees
     maxScale = 3,             // max allowed scale, n - homography can be up to nx bigger or nx smaller
     maxShear = 0.3,           // max allowed shear
-    maxPerspective = 0.001    // max allowed perspective distortion
+    maxPerspective = 0.01     // max allowed perspective distortion
   } = options;
   const minScale = 1 / maxScale;
 
