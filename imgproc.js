@@ -16,26 +16,39 @@ const identityMatrix = [
   0, 0, 0, 1
 ];
 
+// Column-major flat 4x4 (index = col*4 + row) - the same layout WebGL/OpenGL
+// (and so p5.js's applyMatrix() in WEBGL mode) use natively.
 function applyTransform4x4(px, py, M) {
-  // strict: accept only flat row-major 4x4 arrays (length 16)
   if (!Array.isArray(M) || M.length !== 16) return [px, py];
 
-  const X = M[0] * px + M[1] * py + M[2] * 0 + M[3];
-  const Y = M[4] * px + M[5] * py + M[6] * 0 + M[7];
-  const W = M[12] * px + M[13] * py + M[14] * 0 + M[15];
+  const X = M[0] * px + M[4] * py + M[8] * 0 + M[12];
+  const Y = M[1] * px + M[5] * py + M[9] * 0 + M[13];
+  const W = M[3] * px + M[7] * py + M[11] * 0 + M[15];
 
   if (!isFinite(W) || Math.abs(W) < 1e-12) return [X, Y];
   return [X / W, Y / W];
 }
 
 /**
- * Multiplies two 4x4 row-major flat matrices and returns the literal matrix
- * product A * B. applyTransform4x4 applies a matrix to a column vector
- * (M * p), so to compose "apply A to a point first, then apply B to the
- * result" - i.e. B * (A * p) - call multiplyMatrix4x4(B, A), not (A, B).
- * @param {Array} A - flat 16-element row-major 4x4 matrix
- * @param {Array} B - flat 16-element row-major 4x4 matrix
- * @returns {Array} - flat 16-element row-major 4x4 matrix (A * B)
+ * Converts a flat 16-element column-major 4x4 matrix into the flat
+ * 6-element array [a, b, c, d, e, f] that both the HTML5 canvas API's
+ * setTransform() and p5.js's applyMatrix() (2D mode) expect.
+ * @param {Array} M - flat 16-element column-major 4x4 matrix
+ * @returns {Array|null} - [a, b, c, d, e, f], or null if M isn't a flat 16-element array
+ */
+function to2dAffine(M) {
+  if (!Array.isArray(M) || M.length !== 16) return null;
+  return [M[0], M[1], M[4], M[5], M[12], M[13]];
+}
+
+/**
+ * Multiplies two 4x4 column-major flat matrices and returns the literal
+ * matrix product A * B. applyTransform4x4 applies a matrix to a column
+ * vector (M * p), so to compose "apply A to a point first, then apply B to
+ * the result" - i.e. B * (A * p) - call multiplyMatrix4x4(B, A), not (A, B).
+ * @param {Array} A - flat 16-element column-major 4x4 matrix
+ * @param {Array} B - flat 16-element column-major 4x4 matrix
+ * @returns {Array} - flat 16-element column-major 4x4 matrix (A * B)
  */
 function multiplyMatrix4x4(A, B) {
   let result = null;
@@ -49,9 +62,9 @@ function multiplyMatrix4x4(A, B) {
       for (let col = 0; col < 4; col++) {
         let sum = 0;
         for (let k = 0; k < 4; k++) {
-          sum += A[row * 4 + k] * B[k * 4 + col];
+          sum += A[k * 4 + row] * B[col * 4 + k];
         }
-        result[row * 4 + col] = sum;
+        result[col * 4 + row] = sum;
       }
     }
   }
@@ -123,18 +136,18 @@ function cofactor4x4(m, row, col) {
  * - Low shear
  * - Low perspective distortion (bottom row close to [0, 0, 1])
  *
- * @param {Array} H - flat 9-element row-major 3x3 homography, or flat 16-element 4x4
+ * @param {Array} H - flat 9-element row-major 3x3 homography, or flat 16-element column-major 4x4
  * @param {Object} options - optional thresholds
  * @returns {Object} { valid, reason, rotation, scale, shear, perspective }
  */
 function isReasonableHomography(H, options = {}) {
   const {
     maxRotationDeg = 15,      // max allowed rotation in degrees
-    minScale = 0.5,           // min allowed scale
-    maxScale = 2.0,           // max allowed scale
+    maxScale = 3,             // max allowed scale, n - homography can be up to nx bigger or nx smaller
     maxShear = 0.3,           // max allowed shear
-    maxPerspective = 0.001    // max allowed perspective distortion
+    maxPerspective = 0.01     // max allowed perspective distortion
   } = options;
+  const minScale = 1 / maxScale;
 
   if (!H) return { valid: false, reason: 'H is null or undefined' };
 
@@ -143,10 +156,10 @@ function isReasonableHomography(H, options = {}) {
   if (H.length === 9) {
     [h00, h01, h02, h10, h11, h12, h20, h21, h22] = H;
   } else if (H.length === 16) {
-    // 4x4 row-major: extract the 2D affine/projective part
-    h00 = H[0];  h01 = H[1];  h02 = H[3];   // skip H[2] (z column)
-    h10 = H[4];  h11 = H[5];  h12 = H[7];
-    h20 = H[12]; h21 = H[13]; h22 = H[15];
+    // 4x4 column-major: extract the 2D affine/projective part
+    h00 = H[0];  h01 = H[4];  h02 = H[12];  // skip H[8] (z column)
+    h10 = H[1];  h11 = H[5];  h12 = H[13];
+    h20 = H[3];  h21 = H[7];  h22 = H[15];
   } else {
     return { valid: false, reason: 'H must be length 9 or 16' };
   }
@@ -244,17 +257,17 @@ function isReasonableHomography(H, options = {}) {
 function stripShear(transform) {
   if (!transform) return transform;
 
-  const a = transform[0], c = transform[4];
-  const tx = transform[3], ty = transform[7];
+  const a = transform[0], c = transform[1];
+  const tx = transform[12], ty = transform[13];
 
   const scale = Math.hypot(a, c) || 1;
   const cosT = a / scale, sinT = c / scale;
 
   return [
-    scale * cosT, -scale * sinT, 0, tx,
-    scale * sinT,  scale * cosT, 0, ty,
+    scale * cosT, scale * sinT, 0, 0,
+    -scale * sinT, scale * cosT, 0, 0,
     0, 0, 1, 0,
-    0, 0, 0, 1
+    tx, ty, 0, 1
   ];
 }
 
@@ -295,10 +308,10 @@ function alignImagePair(imageA, imageB, options = {}) {
   }
 
   const transform = [
-    h.data64F[0], h.data64F[1], 0, h.data64F[2],
-    h.data64F[3], h.data64F[4], 0, h.data64F[5],
+    h.data64F[0], h.data64F[3], 0, h.data64F[6],
+    h.data64F[1], h.data64F[4], 0, h.data64F[7],
     0, 0, 1, 0,
-    h.data64F[6], h.data64F[7], 0, h.data64F[8]
+    h.data64F[2], h.data64F[5], 0, h.data64F[8]
   ];
 
   return { valid: true, transform, inliers, reason: check.reason };

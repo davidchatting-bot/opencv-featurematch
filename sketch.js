@@ -158,7 +158,8 @@ function generateLowResImage(imgElement, onloaded = () => {}) {
     lowresImg = createImg(dataUrl, '');
     lowresImg.elt.onload = onloaded;
 
-    // Attach a 4x4 scaling transform (row-major)
+    // Attach a 4x4 scaling transform (column-major; diagonal-only here so
+    // identical either way)
     const invS = 1 / s;
     const scaleTransform = [
       invS, 0, 0, 0,
@@ -523,14 +524,9 @@ function exportAllMediaElements(selector) {
       const imgH = img.naturalHeight || img.height;
 
       // Extract 2D affine for canvas setTransform(a, b, c, d, e, f)
-      // Canvas: | a c e |  Our 4x4: X = M[0]*x + M[1]*y + M[3]
-      //         | b d f |           Y = M[4]*x + M[5]*y + M[7]
-      const a = transform[0];
-      const b = transform[4];
-      const c = transform[1];
-      const d = transform[5];
-      const tx = transform[3] - mediaBoundingBox.left;
-      const ty = transform[7] - mediaBoundingBox.top;
+      const [a, b, c, d, e, f] = to2dAffine(transform);
+      const tx = e - mediaBoundingBox.left;
+      const ty = f - mediaBoundingBox.top;
 
       ctx.save();
       ctx.setTransform(a, b, c, d, tx, ty);
